@@ -131,6 +131,8 @@ type reviewFlags struct {
 	base            string
 	uncommittedOnly bool
 	staged          bool
+	pr              int
+	prRemote        string
 	task            string
 	format          string
 	maxSeverity     string
@@ -354,6 +356,8 @@ func addReviewFlags(cmd *cobra.Command, f *reviewFlags) {
 	fl.StringVar(&f.base, "base", "", "diff base ref (default: origin/main with fallbacks)")
 	fl.BoolVar(&f.uncommittedOnly, "uncommitted-only", false, "only review uncommitted changes")
 	fl.BoolVar(&f.staged, "staged", false, "review exactly the staged set")
+	fl.IntVar(&f.pr, "pr", 0, "review pull request N, fetched from refs/pull/N/head into a temporary worktree")
+	fl.StringVar(&f.prRemote, "pr-remote", defaultPullRequestRemote, "remote to fetch --pr from")
 	fl.StringVar(&f.task, "task", "(not provided)", "what the builder was asked to do")
 	fl.StringVar(&f.format, "format", "both", "json|markdown|both")
 	fl.StringVar(&f.maxSeverity, "max-severity", "", "exit 1 when a finding meets INFO|LOW|MEDIUM|HIGH|CRITICAL")
@@ -443,6 +447,9 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 	if survey && (f.staged || f.uncommittedOnly || f.base != "") {
 		return &usageError{msg: "--scope repo cannot be combined with --staged, --uncommitted-only, or --base"}
 	}
+	if err := validatePullRequestFlags(changed, f); err != nil {
+		return err
+	}
 	gateRank := -1
 	if f.maxSeverity != "" {
 		sev, ok := review.ParseSeverity(strings.ToUpper(f.maxSeverity))
@@ -503,6 +510,18 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 	if err != nil {
 		return &usageError{msg: err.Error()}
 	}
+	// History and run records stay keyed to the operator's repository; only
+	// diff production and file reads move into a pull request's worktree,
+	// which shares that repository's object store and refs.
+	recordRepo := repo
+	pr, err := preparePullRequest(ctx, f, repo, stderr)
+	if err != nil {
+		return err
+	}
+	defer closePullRequest(pr, stderr)
+	if pr != nil {
+		repo = pr.Dir
+	}
 	excludes := append(append([]string{}, cfg.Review.Excludes...), f.excludes...)
 	maxDiffDefault, maxFileContextDefault := defaultMaxDiffBytes, defaultMaxFileCtxBytes
 	if f.quick {
@@ -523,6 +542,9 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 		// No one file's diff can be shown past the whole-diff budget, so
 		// Build need not hold more of it than that.
 		MaxFileDiffBytes: maxDiff,
+	}
+	if pr != nil {
+		build.Base = pr.Base
 	}
 	tree := rcontext.Tree{}
 	if f.staged {
@@ -713,7 +735,7 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 	}
 	envValues, envNames := record.CaptureEnv(cfg.CredentialEnvNames()...)
 	meta := record.Meta{
-		RunID: runID, TS: time.Now().UTC().Format(time.RFC3339Nano), Repo: repo,
+		RunID: runID, TS: time.Now().UTC().Format(time.RFC3339Nano), Repo: recordRepo,
 		Argv:  append([]string(nil), os.Args[1:]...),
 		Roast: record.BuildMeta{Version: buildinfo.Version, Commit: buildinfo.Commit},
 		Scope: record.ScopeMeta{
@@ -722,6 +744,7 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 			Paths: append([]string(nil), f.paths...), Excludes: append([]string(nil), excludes...),
 			BaseOID: scopeBaseOID, MergeBaseOID: sc.MergeBaseOID, HeadOID: scopeHeadOID,
 			Survey: sc.Survey, Staged: sc.Staged, Files: append([]string(nil), sc.Files...),
+			PullRequest: pullRequestMeta(pr),
 		},
 		Derived: record.DerivedMeta{
 			Mode: mode, Langs: append([]string(nil), langs...), Quick: f.quick,
@@ -826,11 +849,11 @@ func runReviewCommand(ctx context.Context, changed func(string) bool, f *reviewF
 	if spent, limit := ledger.Committed(); limit > 0 {
 		budgets["ledger_committed_tokens"] = spent
 	}
-	report.Prior = priorNotes(repo, result)
+	report.Prior = priorNotes(recordRepo, result)
 	writeReport(stdout, stderr, f, report)
 	meta.Usage = usageMeta(usage)
 	meta.Budgets = budgets
-	finalErr := finalizeRunArtifacts(meta, report, repo)
+	finalErr := finalizeRunArtifacts(meta, report, recordRepo)
 	if finalErr == nil {
 		runupload.MaybeAutoUpload(cfg, record.DefaultDir(), runID)
 		if reportPath, pathErr := record.ReportPath(runID); pathErr == nil {

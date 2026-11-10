@@ -57,6 +57,18 @@ type ScopeMeta struct {
 	Survey          bool     `json:"survey,omitempty"`
 	Staged          bool     `json:"staged,omitempty"`
 	Files           []string `json:"files,omitempty"`
+	// PullRequest is set when the review ran on a fetched pull request head
+	// (`--pr`) instead of the local checkout.
+	PullRequest *PullRequestMeta `json:"pull_request,omitempty"`
+}
+
+// PullRequestMeta identifies the pull request a review fetched.
+type PullRequestMeta struct {
+	Remote  string `json:"remote"`
+	Number  int    `json:"number"`
+	HeadOID string `json:"head_oid"`
+	BaseRef string `json:"base_ref"`
+	BaseOID string `json:"base_oid"`
 }
 
 type DerivedMeta struct {
